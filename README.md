@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PowerShell script tests the Windows Sandbox escape technique documented in the ITOCHU Cyber & Intelligence blog post. It automates the setup and execution of a controlled security research test that demonstrates how scheduled tasks can be used to escape Windows Sandbox isolation.
+This PowerShell script tests the Windows Sandbox escape technique documented in the [ITOCHU Cyber & Intelligence blog post](https://blog-en.itochuci.co.jp/entry/2025/03/12/140000). It automates the setup and execution of a controlled security research test that demonstrates how scheduled tasks can be used to escape Windows Sandbox isolation.
 
 ## Threat Background
 
@@ -37,16 +37,27 @@ Windows Sandbox provides attackers with several advantages:
 - When executed via Task Scheduler under SYSTEM privileges, sandbox runs in background without visible window
 - Artifacts within the sandbox are deleted when it closes, making forensic investigation difficult
 
-### Emerging Threats - wsb.exe Command-Line Interface
+### Emerging Threats - Windows Sandbox CLI (wsb.exe)
 
-Windows 11 updates introduced wsb.exe, which significantly increases attack surface:
+Starting with Windows 11 version 24H2, Microsoft introduced wsb.exe, the Windows Sandbox Command-Line Interface. This new tool provides powerful capabilities for creating, managing, and controlling sandboxes programmatically. While enhancing legitimate use cases, wsb.exe significantly increases the attack surface:
 
-- Background execution without GUI
-- Sandbox configuration via command-line arguments (no WSB file needed)
-- Persistent data inside sandbox when window is closed
-- Remote session capabilities
+**New Capabilities via wsb.exe:**
+- `wsb start`: Create and launch sandboxes (with optional inline configuration)
+- `wsb list`: Display running sandbox sessions
+- `wsb exec`: Execute commands within running sandboxes
+- `wsb stop`: Terminate sandbox sessions
+- `wsb share`: Share host folders with sandbox at runtime
+- `wsb connect`: Start remote desktop session to sandbox
+- `wsb ip`: Get sandbox IP address
 
-These updates make detection more challenging as traditional forensic artifacts (WSB files) may not exist.
+**Attack Surface Implications:**
+- Background execution without GUI (no visible window until wsb connect)
+- Sandbox configuration via command-line arguments (no WSB file artifact required)
+- Persistent data inside sandbox when window is closed (requires explicit wsb stop)
+- Remote execution capabilities within running sandboxes
+- Runtime folder sharing without predefined configuration
+
+These updates make detection more challenging as traditional forensic artifacts (WSB files) may not exist when attackers use inline configuration strings.
 
 ## Prerequisites
 
@@ -134,6 +145,36 @@ Based on ITOCHU Cyber & Intelligence research, MirrorFace used the following att
 7. Attacker operates with access to host files through mapped folders
 8. No detection by host security products or monitoring tools
 
+#### Modern Attack Techniques Using wsb.exe CLI
+
+With the introduction of wsb.exe in Windows 11 24H2, attackers can now:
+
+**Example 1: Fileless Sandbox Launch**
+```powershell
+wsb.exe start --config "<Configuration><Networking>Enable</Networking><MappedFolders><MappedFolder><HostFolder>C:\Users\Public</HostFolder><SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\Shared</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder></MappedFolders><LogonCommand><Command>powershell.exe -enc [base64_payload]</Command></LogonCommand></Configuration>"
+```
+No WSB file artifact is created, making forensic investigation more difficult.
+
+**Example 2: Runtime Command Execution**
+```powershell
+$sandboxId = (wsb.exe start --raw | ConvertFrom-Json).Id
+Start-Sleep -Seconds 10
+wsb.exe exec --id $sandboxId -c "powershell.exe -File C:\malware.ps1" -r System
+```
+Executes malware after sandbox initialization without LogonCommand.
+
+**Example 3: Runtime Folder Sharing**
+```powershell
+wsb.exe share --id $sandboxId -f "C:\Sensitive\Data" -s "C:\Users\WDAGUtilityAccount\Desktop\Data" --allow-write
+```
+Dynamically exposes sensitive host folders after sandbox is running.
+
+**Example 4: Background Persistence**
+```powershell
+schtasks /create /tn "SystemUpdate" /tr "wsb.exe start --config \"<Configuration>...</Configuration>\"" /sc onlogon /ru SYSTEM
+```
+Scheduled task launches sandbox in background on every logon.
+
 #### Stealth Techniques
 - **Background Execution**: When launched via Task Scheduler under SYSTEM account, no sandbox window appears
 - **Tor Network**: Encrypts C2 communication and conceals C2 server location
@@ -204,17 +245,26 @@ If the scheduled task is registered as a service
       *[EventData[Data[@Name='Image'] and (
         Data='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' or
         Data='C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe' or
-        Data='C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe'
+        Data='C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe' or
+        Data='C:\Windows\System32\WindowsSandbox.exe' or
+        Data ends-with '\wsb.exe'
       )]]
     </Select>
   </Query>
 </QueryList>
 ```
 
-Key fields to examine:
+**Key fields to examine:**
 - ParentImage (should show WindowsSandbox.exe or related)
 - CommandLine (shows script execution details)
 - User (WDAGUtilityAccount indicates sandbox context)
+
+**Critical wsb.exe Detection:**
+Monitor CommandLine field for:
+- `wsb start` with `--config` parameter containing inline XML
+- `wsb exec` commands executing suspicious payloads
+- `wsb share` operations mapping sensitive host folders
+- Example: `wsb.exe start --config "<Configuration><Networking>Enable</Networking>..."`
 
 #### Event ID 11 - File Creation
 Monitor for:
@@ -259,14 +309,21 @@ Monitor the following processes to detect Windows Sandbox execution on the host:
 
 | Process Name | Path | Detection Context |
 |--------------|------|-------------------|
-| WindowsSandbox.exe | C:\Windows\System32\WindowsSandbox.exe | WSB file execution and normal startup |
-| WindowsSandboxClient.exe | C:\Windows\System32\WindowsSandboxClient.exe | WSB file execution and normal startup |
-| cmproxyd.exe | C:\Windows\System32\cmproxyd.exe | WSB file execution and normal startup |
-| WindowsSandboxServer.exe | C:\Program Files\WindowsApps\MicrosoftWindows.WindowsSandbox_0.3.1.0_x64__cw5n1h2txyewy | Command execution using wsb.exe (Windows 11 preview only) |
-| WindowsSandboxRemoteSession.exe | C:\Program Files\WindowsApps\MicrosoftWindows.WindowsSandbox_0.3.1.0_x64__cw5n1h2txyewy | Command execution using wsb.exe (Windows 11 preview only) |
-| wsb.exe | C:\Users\{USERNAME}\AppData\Local\Microsoft\WindowsApps\wsb.exe | Command-line sandbox execution (Windows 11 preview only) |
-| vmmemWindowsSandbox | Memory process | Contains sandbox memory (Windows 11) |
-| vmmem | Memory process | Contains sandbox memory (Windows 10) |
+| WindowsSandbox.exe | C:\Windows\System32\WindowsSandbox.exe | Traditional sandbox launcher (GUI), executes WSB files |
+| wsb.exe | C:\Users\{USERNAME}\AppData\Local\Microsoft\WindowsApps\wsb.exe | **Windows Sandbox CLI** - Command-line tool for creating and managing sandboxes (Windows 11 24H2+). Can launch sandboxes without WSB files |
+| WindowsSandboxClient.exe | C:\Windows\System32\WindowsSandboxClient.exe | Sandbox client component |
+| cmproxyd.exe | C:\Windows\System32\cmproxyd.exe | Container manager proxy daemon |
+| WindowsSandboxServer.exe | C:\Program Files\WindowsApps\MicrosoftWindows.WindowsSandbox_*_x64__cw5n1h2txyewy | Sandbox server component (Windows 11 preview versions) |
+| WindowsSandboxRemoteSession.exe | C:\Program Files\WindowsApps\MicrosoftWindows.WindowsSandbox_*_x64__cw5n1h2txyewy | Remote session handler (Windows 11 preview versions) |
+| vmmemWindowsSandbox | Memory process | Contains sandbox memory (Windows 11) - can be scanned for malware signatures |
+| vmmem | Memory process | Contains sandbox memory (Windows 10) - can be scanned for malware signatures |
+
+**Critical Detection Notes:**
+- **wsb.exe** is the command-line interface starting in Windows 11 24H2
+- **WindowsSandbox.exe** is the traditional GUI launcher that processes WSB files
+- Attackers may use either method depending on Windows version and desired stealth
+- Monitor parent processes: wsb.exe launched from cmd.exe, powershell.exe, or schtasks.exe is suspicious
+- Monitor for inline configuration strings in wsb.exe command lines (no WSB file artifact)
 
 ### Windows Sandbox Event IDs
 
@@ -297,16 +354,27 @@ Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" | Where-Object {
 ### Splunk Query
 ```
 index=windows (source="WinEventLog:Security" EventCode IN (4688, 4720, 4624)) OR (source="WinEventLog:Microsoft-Windows-Sysmon/Operational" EventCode IN (1, 3, 11, 13))
-| search "WSBShenanigans" OR "DNSLookup" OR "SharedFolder" OR "WDAGUtilityAccount"
+| search "WSBShenanigans" OR "DNSLookup" OR "SharedFolder" OR "WDAGUtilityAccount" OR "wsb.exe" OR "WindowsSandbox.exe"
 | table _time, EventCode, ComputerName, User, Process, CommandLine, TargetFilename
+| search CommandLine="*wsb*start*--config*" OR CommandLine="*wsb*exec*" OR CommandLine="*wsb*share*"
 ```
 
 ### Elastic/ELK Query
 ```
 event.code:(4688 OR 4720 OR 4624 OR 1 OR 3 OR 11 OR 13) AND 
-(process.name:("powershell.exe" OR "csc.exe" OR "DNSLookup.exe") OR 
+(process.name:("powershell.exe" OR "csc.exe" OR "DNSLookup.exe" OR "wsb.exe" OR "WindowsSandbox.exe") OR 
  user.name:"WSBShenanigans" OR 
- file.path:*SharedFolder*)
+ file.path:*SharedFolder* OR
+ process.command_line:(*wsb*start* OR *wsb*exec* OR *wsb*share*))
+```
+
+### Advanced wsb.exe Detection Query (Sysmon Event 1)
+```
+index=sysmon EventCode=1 Image="*\\wsb.exe"
+| rex field=CommandLine "(?<wsb_command>start|exec|stop|share|list|connect|ip)"
+| rex field=CommandLine "--config\s+\"(?<inline_config>[^\"]+)\""
+| table _time, Computer, User, ParentImage, CommandLine, wsb_command, inline_config
+| where isnotnull(inline_config) OR wsb_command IN ("exec", "share")
 ```
 
 ## Detection Indicators
@@ -446,12 +514,24 @@ This script is for authorized security testing and research only. Use only in co
    - Monitor privilege escalation attempts
 
 3. **Implement AppLocker Policies**
-   - Create policies to block Windows Sandbox executables
-   - Block the following processes:
-     - WindowsSandbox.exe
-     - WindowsSandboxClient.exe
-     - wsb.exe
-   - AppLocker generates Event ID 8003 (EXE and DLL), 8004 (Script), 8006 (MSI), 8007 (Packaged app) when blocking execution
+   - Create policies to block Windows Sandbox executables:
+     - `C:\Windows\System32\WindowsSandbox.exe`
+     - `C:\Windows\System32\WindowsSandboxClient.exe`
+     - `C:\Users\*\AppData\Local\Microsoft\WindowsApps\wsb.exe`
+     - `%LOCALAPPDATA%\Microsoft\WindowsApps\wsb.exe`
+   - AppLocker generates the following Event IDs when blocking:
+     - Event ID 8003 (EXE and DLL)
+     - Event ID 8004 (Script)
+     - Event ID 8006 (MSI)
+     - Event ID 8007 (Packaged app)
+   - Example AppLocker rule for wsb.exe:
+     ```xml
+     <FilePathRule Id="..." Name="Block wsb.exe" Description="Prevent Windows Sandbox CLI execution" UserOrGroupSid="S-1-1-0" Action="Deny">
+       <Conditions>
+         <FilePathCondition Path="%LOCALAPPDATA%\Microsoft\WindowsApps\wsb.exe" />
+       </Conditions>
+     </FilePathRule>
+     ```
 
 4. **Group Policy Management**
    - Use Group Policy to prevent installation of Windows Sandbox feature
@@ -464,9 +544,18 @@ This script is for authorized security testing and research only. Use only in co
    - Track changes to optional features via Event Logs
 
 2. **Process Monitoring**
-   - Alert on execution of Windows Sandbox processes
+   - Alert on execution of Windows Sandbox processes:
+     - WindowsSandbox.exe
+     - wsb.exe (Windows 11 24H2+)
+     - WindowsSandboxClient.exe
+     - cmproxyd.exe
    - Monitor parent-child process relationships
    - Watch for sandbox processes launched from unexpected parents (e.g., Task Scheduler, schtasks.exe)
+   - **Critical**: Monitor wsb.exe command-line arguments for:
+     - Inline configuration strings (--config parameter)
+     - Remote execution commands (wsb exec)
+     - Runtime folder sharing (wsb share)
+     - Suspicious working directories or user contexts
 
 3. **Memory Scanning**
    - Scan vmmemWindowsSandbox (Windows 11) or vmmem (Windows 10) process memory
@@ -565,6 +654,9 @@ https://learn.microsoft.com/en-us/windows/security/application-security/applicat
 Windows Sandbox Configuration
 https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-configure-using-wsb-file
 
+Windows Sandbox Command-Line Interface (wsb.exe)
+https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli
+
 Windows 11 KB5044384 Update (wsb.exe introduction)
 https://support.microsoft.com/en-us/topic/october-24-2024-kb5044384-os-build-26100-2161-preview-5a4ac390-7c7b-4f7f-81c2-c2b329ac86ab
 
@@ -573,4 +665,4 @@ https://learn.microsoft.com/en-us/windows/security/application-security/applicat
 
 ## License
 
-This script is provided for educational and authorized security testing purposes only. Use at your own risk. Brush your teeth and floss, and also consider eating less and excercising more while we are giving advice 
+This script is provided for educational and authorized security testing purposes only.
